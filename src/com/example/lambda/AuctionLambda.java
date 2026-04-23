@@ -192,7 +192,7 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
     }
 
     private void publishNotification(String type, Long receiverId, Long auctionId, String itemName, Context context) {
-        try (Jedis jedis = new Jedis(REDIS_HOST, REDIS_PORT, true)) {
+        try {
             Map<String, Object> message = Map.of(
                     "type", type,
                     "receiverId", receiverId,
