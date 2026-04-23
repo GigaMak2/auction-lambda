@@ -18,6 +18,8 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
     private static final String REDIS_HOST = System.getenv("REDIS_HOST");
     private static final int REDIS_PORT = 6379;
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    // static 으로 만들어 재사용
+    private static final Jedis jedis = new Jedis(REDIS_HOST, REDIS_PORT, true);
 
     @Override
     public String handleRequest(Map<String, Object> event, Context context) {
@@ -137,7 +139,7 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
 
     private void publishToRedis(Long auctionId, String eventType, Context context) {
         // jedis: 자바에서 레디스에 접속하고 명령어 쓸 수 있게 해주는 도구. spring의 redistemplate 나 redisson 같은 것
-        try (Jedis jedis = new Jedis(REDIS_HOST, REDIS_PORT, true)) {
+        try  {
             Map<String, Object> message = Map.of(
                     "auctionId", auctionId,
                     "eventType", eventType
