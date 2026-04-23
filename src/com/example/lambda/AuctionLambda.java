@@ -71,6 +71,19 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
 
                 publishToRedis(auctionId, "AUCTION_STARTED", context);
 
+                String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
+                try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
+                    selectPs.setLong(1, auctionId);
+                    var rs = selectPs.executeQuery();
+
+                    if (rs.next()) {
+                        Long receiverId = rs.getLong("user_id");
+                        String itemName = rs.getString("item_name");
+
+                        publishNotification("AUCTION_STARTED", receiverId, auctionId, itemName, context);
+                    }
+                }
+
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
             }
         }
@@ -119,6 +132,19 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
 
                 publishToRedis(auctionId, "AUCTION_ENDED", context);
 
+                String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
+                try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
+                    selectPs.setLong(1, auctionId);
+                    var auctionRs = selectPs.executeQuery();
+                    if (auctionRs.next()) {
+                        String itemName = auctionRs.getString("item_name");
+                        Long buyerId = auctionRs.getLong("user_id");
+
+                        publishNotification("AUCTION_CLOSED_WIN", winnerId, auctionId, itemName, context);
+                        publishNotification("AUCTION_CLOSED_BUYER", buyerId, auctionId, itemName, context);
+                    }
+                }
+
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
             } else {
                 // 유찰 처리
@@ -131,6 +157,18 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
                 long redisStart = System.currentTimeMillis();
 
                 publishToRedis(auctionId, "AUCTION_NO_BID", context);
+
+                String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
+                try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
+                    selectPs.setLong(1, auctionId);
+                    var auctionRs = selectPs.executeQuery();
+                    if (auctionRs.next()) {
+                        String itemName = auctionRs.getString("item_name");
+                        Long buyerId = auctionRs.getLong("user_id");
+
+                        publishNotification("AUCTION_NO_BID", buyerId, auctionId, itemName, context);
+                    }
+                }
 
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
             }
@@ -150,6 +188,22 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
             context.getLogger().log("[Redis] 이벤트 발행: " + payload);
         } catch (Exception e) {
             context.getLogger().log("[Redis] 발행 실패: " + e.getMessage());
+        }
+    }
+
+    private void publishNotification(String type, Long receiverId, Long auctionId, String itemName, Context context) {
+        try (Jedis jedis = new Jedis(REDIS_HOST, REDIS_PORT, true)) {
+            Map<String, Object> message = Map.of(
+                    "type", type,
+                    "receiverId", receiverId,
+                    "auctionId", auctionId,
+                    "itemName", itemName
+            );
+            String payload = objectMapper.writeValueAsString(message);
+            jedis.publish("auction:notification", payload);
+            context.getLogger().log("[Notification] 이벤트 발행: " + payload);
+        } catch (Exception e) {
+            context.getLogger().log("[Notification] 발행 실패: " + e.getMessage());
         }
     }
 }
