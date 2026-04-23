@@ -17,6 +17,7 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
     private static final String DB_PASSWORD = System.getenv("DB_PASSWORD");
     private static final String REDIS_HOST = System.getenv("REDIS_HOST");
     private static final int REDIS_PORT = 6379;
+
     private static final ObjectMapper objectMapper = new ObjectMapper();
     // static 으로 만들어 재사용
     private static final Jedis jedis = new Jedis(REDIS_HOST, REDIS_PORT, true);
