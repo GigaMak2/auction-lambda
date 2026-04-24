@@ -4,6 +4,8 @@ import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -20,7 +22,10 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
     // static 으로 만들어 재사용
-    private static final Jedis jedis = new Jedis(REDIS_HOST, REDIS_PORT, true);
+    // jedispoolconfig: 커넥션 몇개까지만들지. 기본값 최대8
+    private static final JedisPool jedisPool = new JedisPool(
+            new JedisPoolConfig(), REDIS_HOST, REDIS_PORT, 2000, true
+    );
 
     @Override
     public String handleRequest(Map<String, Object> event, Context context) {
@@ -140,7 +145,7 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
 
     private void publishToRedis(Long auctionId, String eventType, Context context) {
         // jedis: 자바에서 레디스에 접속하고 명령어 쓸 수 있게 해주는 도구. spring의 redistemplate 나 redisson 같은 것
-        try  {
+        try (Jedis jedis = jedisPool.getResource()) {
             Map<String, Object> message = Map.of(
                     "auctionId", auctionId,
                     "eventType", eventType
