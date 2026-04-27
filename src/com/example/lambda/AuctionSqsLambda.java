@@ -100,8 +100,13 @@ public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, Str
             }
         }
 
+        // cache eviction
+        long evictionStart = System.currentTimeMillis();
+
         evictCache("auction::getAuction::%s".formatted(auctionId), context);
         evictCache("auction::getManyAuctionsPublic::*", context);
+
+        context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
     }
 
     private void endAuction(Connection conn, Long auctionId, Context context) throws Exception {
@@ -189,8 +194,13 @@ public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, Str
             }
         }
 
+        // cache eviction
+        long evictionStart = System.currentTimeMillis();
+
         evictCache("auction::getAuction::%s".formatted(auctionId), context);
         evictCache("auction::getManyAuctionsPublic::*", context);
+
+        context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
     }
 
 
@@ -228,6 +238,10 @@ public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, Str
     }
 
     private void evictCache(String pattern, Context context) {
+        context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실행.".formatted(
+                    pattern
+        ));
+
         try (Jedis jedis = jedisPool.getResource()){
             String cursor = ScanParams.SCAN_POINTER_START;
             ScanParams scanParams = new ScanParams().match(pattern).count(EVICT_CACHE_LOOP_BATCH_SIZE);
@@ -256,7 +270,7 @@ public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, Str
 
                 // 저희가 cache를 다 지우기도 전에 EVICT_CACHE_LOOP_UPPER_BOUND를 부딪쳤다는 사실을 log
                 if (i == EVICT_CACHE_LOOP_UPPER_BOUND - 1 && !scan.getCursor().equals("0")) {
-                    context.getLogger().log("[Notification] key (%s) cache eviction을 다 하기 전에 제한 횟수에 도달했습니다.".formatted(
+                    context.getLogger().log("[Cache-Evict] key (%s) cache eviction을 다 하기 전에 제한 횟수에 도달했습니다.".formatted(
                                 pattern
                     ));
                 }
@@ -268,7 +282,7 @@ public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, Str
                 cursor = scan.getCursor();
             }
         } catch (Exception e) {
-            context.getLogger().log("[Notification] key (%s) cache eviction 실패: %s".formatted(
+            context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실패: %s".formatted(
                         pattern, e.getMessage()
             ));
         }
