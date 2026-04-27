@@ -181,6 +181,7 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
     }
 
 
+    // 경매 시작/종료 이벤트 발행
     private void publishToRedis(Long auctionId, String eventType, Context context) {
         // jedis: 자바에서 레디스에 접속하고 명령어 쓸 수 있게 해주는 도구. spring의 redistemplate 나 redisson 같은 것
         try (Jedis jedis = jedisPool.getResource()) {
@@ -196,8 +197,9 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
         }
     }
 
+    // 알림 이벤트 발행
     private void publishNotification(String type, Long receiverId, Long auctionId, String itemName, Context context) {
-        try {
+        try (Jedis jedis = jedisPool.getResource()){
             Map<String, Object> message = Map.of(
                     "type", type,
                     "receiverId", receiverId,
