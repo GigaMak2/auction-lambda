@@ -29,6 +29,7 @@ dependencies {
     implementation 'org.postgresql:postgresql:42.7.1'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.0'
     implementation 'redis.clients:jedis:5.1.0'
+    implementation 'com.amazonaws:aws-java-sdk-sqs:1.12.772'
 }
 
 jar {
