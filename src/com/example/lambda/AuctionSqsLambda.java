@@ -2,6 +2,7 @@ package com.example.lambda;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.SQSBatchResponse;
 import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import redis.clients.jedis.Jedis;
@@ -11,10 +12,12 @@ import redis.clients.jedis.JedisPoolConfig;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 // sqs가 이 코드를 트리거해서 rds 변경 + redis 발행
-public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
+public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchResponse> {
 
     private static final String DB_URL = System.getenv("DB_URL");
     private static final String DB_USERNAME = System.getenv("DB_USERNAME");
@@ -30,7 +33,10 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
     );
 
     @Override
-    public String handleRequest(SQSEvent event, Context context) {
+    public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
+
+        // 실패한 메시지만 담아서 재시도 예정
+        List<SQSBatchResponse.BatchItemFailure> failures = new ArrayList<>();
 
         for (SQSEvent.SQSMessage message : event.getRecords()) {
             try {
@@ -49,10 +55,15 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
                 }
             } catch (Exception e) {
                 context.getLogger().log("[Lambda] Error: " + e.getMessage());
-                throw new RuntimeException(e);
+                // 실패한 메시지만 재시도
+                failures.add(SQSBatchResponse.BatchItemFailure.builder()
+                        .withItemIdentifier(message.getMessageId())
+                        .build());
             }
         }
-        return "OK";
+        return SQSBatchResponse.builder()
+                .withBatchItemFailures(failures)
+                .build();
     }
 
     // context: 람다 실행환경 정보를 담고 있음. aws가 주입
@@ -88,6 +99,8 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
                 }
 
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+            } else {
+                context.getLogger().log("[SKIP] 이미 처리된 경매 START: auctionId=" + auctionId);
             }
         }
     }
@@ -99,6 +112,7 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
             ps.setLong(1, auctionId);
             var rs = ps.executeQuery();
 
+            // 낙찰자가 있다면
             if (rs.next()) {
                 // 낙찰 처리
                 Long winnerId = rs.getLong("user_id");
@@ -106,74 +120,83 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
                 java.math.BigDecimal price = rs.getBigDecimal("price");
 
                 // 경매 상태 DONE으로 변경
-                String updateAuction = "UPDATE auctions SET auction_status = 'DONE' WHERE id = ?";
+                // AND auction_status = active 조건 추가
+                String updateAuction = "UPDATE auctions SET auction_status = 'DONE' WHERE id = ? AND auction_status = 'ACTIVE'";
                 try (PreparedStatement ps2 = conn.prepareStatement(updateAuction)) {
                     ps2.setLong(1, auctionId);
-                    ps2.executeUpdate();
-                }
+                    // updated > 0 중복 처리 방지
+                    int updated = ps2.executeUpdate();
+                    if (updated > 0) {
+                        // 경매 결과 저장
+                        String insertResult = "INSERT INTO auction_results (price, auction_id, buyer_id, seller_id, bid_id) " +
+                                "SELECT ?, ?, user_id, ?, ? FROM auctions WHERE id = ? " +
+                                "AND NOT EXISTS (SELECT 1 FROM auction_results WHERE auction_id = ?)";
+                        try (PreparedStatement ps3 = conn.prepareStatement(insertResult)) {
+                            ps3.setBigDecimal(1, price);
+                            ps3.setLong(2, auctionId);
+                            ps3.setLong(3, winnerId);
+                            ps3.setLong(4, winnerBidId);
+                            ps3.setLong(5, auctionId);
+                            ps3.setLong(6, auctionId);
+                            ps3.executeUpdate();
+                        }
 
-                // 경매 결과 저장
-                String insertResult = "INSERT INTO auction_results (price, auction_id, buyer_id, seller_id, bid_id) " +
-                        "SELECT ?, ?, user_id, ?, ? FROM auctions WHERE id = ?";
-                try (PreparedStatement ps3 = conn.prepareStatement(insertResult)) {
-                    ps3.setBigDecimal(1, price);
-                    ps3.setLong(2, auctionId);
-                    ps3.setLong(3, winnerId);
-                    ps3.setLong(4, winnerBidId);
-                    ps3.setLong(5, auctionId);
-                    ps3.executeUpdate();
-                }
+                        // 입찰 상태 CLOSED로 변경
+                        String updateBids = "UPDATE bids SET status = 'CLOSED' WHERE auction_id = ?";
+                        try (PreparedStatement ps4 = conn.prepareStatement(updateBids)) {
+                            ps4.setLong(1, auctionId);
+                            ps4.executeUpdate();
+                        }
 
-                // 입찰 상태 CLOSED로 변경
-                String updateBids = "UPDATE bids SET status = 'CLOSED' WHERE auction_id = ?";
-                try (PreparedStatement ps4 = conn.prepareStatement(updateBids)) {
-                    ps4.setLong(1, auctionId);
-                    ps4.executeUpdate();
-                }
+                        long redisStart = System.currentTimeMillis();
+                        publishToRedis(auctionId, "AUCTION_ENDED", context);
 
-                long redisStart = System.currentTimeMillis();
-
-                publishToRedis(auctionId, "AUCTION_ENDED", context);
-
-                String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
-                try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
-                    selectPs.setLong(1, auctionId);
-                    var auctionRs = selectPs.executeQuery();
-                    if (auctionRs.next()) {
-                        String itemName = auctionRs.getString("item_name");
-                        Long buyerId = auctionRs.getLong("user_id");
-
-                        publishNotification("AUCTION_CLOSED_WIN", winnerId, auctionId, itemName, context);
-                        publishNotification("AUCTION_CLOSED_BUYER", buyerId, auctionId, itemName, context);
+                        String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
+                        try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
+                            selectPs.setLong(1, auctionId);
+                            var auctionRs = selectPs.executeQuery();
+                            if (auctionRs.next()) {
+                                String itemName = auctionRs.getString("item_name");
+                                Long sellerId = auctionRs.getLong("user_id");
+                                publishNotification("AUCTION_CLOSED_WIN", winnerId, auctionId, itemName, context);
+                                publishNotification("AUCTION_CLOSED_BUYER", sellerId, auctionId, itemName, context);
+                            }
+                        }
+                        context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+                    } else {
+                        // skip된 경우 로그
+                        context.getLogger().log("[SKIP] 이미 처리된 경매 END: auctionId=" + auctionId);
                     }
                 }
-
-                context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+                // 낙찰자가 없다면
             } else {
                 // 유찰 처리
-                String updateAuction = "UPDATE auctions SET auction_status = 'NO_BID' WHERE id = ?";
+                // AND auction_status = active 조건 추가
+                String updateAuction = "UPDATE auctions SET auction_status = 'NO_BID' WHERE id = ? AND auction_status = 'ACTIVE'";
                 try (PreparedStatement ps2 = conn.prepareStatement(updateAuction)) {
                     ps2.setLong(1, auctionId);
-                    ps2.executeUpdate();
-                }
+                    // updated > 0 중복 처리 방지
+                    int updated = ps2.executeUpdate();
+                    if (updated > 0) {
+                        long redisStart = System.currentTimeMillis();
+                        publishToRedis(auctionId, "AUCTION_NO_BID", context);
 
-                long redisStart = System.currentTimeMillis();
-
-                publishToRedis(auctionId, "AUCTION_NO_BID", context);
-
-                String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
-                try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
-                    selectPs.setLong(1, auctionId);
-                    var auctionRs = selectPs.executeQuery();
-                    if (auctionRs.next()) {
-                        String itemName = auctionRs.getString("item_name");
-                        Long buyerId = auctionRs.getLong("user_id");
-
-                        publishNotification("AUCTION_NO_BID", buyerId, auctionId, itemName, context);
+                        String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
+                        try (PreparedStatement selectPs = conn.prepareStatement(selectSql)) {
+                            selectPs.setLong(1, auctionId);
+                            var auctionRs = selectPs.executeQuery();
+                            if (auctionRs.next()) {
+                                String itemName = auctionRs.getString("item_name");
+                                Long sellerId = auctionRs.getLong("user_id");
+                                publishNotification("AUCTION_NO_BID", sellerId, auctionId, itemName, context);
+                            }
+                        }
+                        context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+                    } else {
+                        // skip된 경우 로그
+                        context.getLogger().log("[SKIP] 이미 처리된 경매 NO_BID: auctionId=" + auctionId);
                     }
                 }
-
-                context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
             }
         }
     }
