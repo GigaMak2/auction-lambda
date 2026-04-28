@@ -2,6 +2,7 @@ package com.example.lambda;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
@@ -13,7 +14,7 @@ import java.sql.PreparedStatement;
 import java.util.Map;
 
 // sqs가 이 코드를 트리거해서 rds 변경 + redis 발행
-public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, String> {
+public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
 
     private static final String DB_URL = System.getenv("DB_URL");
     private static final String DB_USERNAME = System.getenv("DB_USERNAME");
@@ -29,33 +30,29 @@ public class AuctionSqsLambda implements RequestHandler<Map<String, Object>, Str
     );
 
     @Override
-    public String handleRequest(Map<String, Object> event, Context context) {
+    public String handleRequest(SQSEvent event, Context context) {
 
-        context.getLogger().log("[시간] Lambda 시작: " + System.currentTimeMillis());
+        for (SQSEvent.SQSMessage message : event.getRecords()) {
+            try {
+                Map<String, Object> body = objectMapper.readValue(message.getBody(), Map.class);
+                Long auctionId = Long.valueOf(body.get("auctionId").toString());
+                String action = body.get("action").toString();
 
-        long start = System.currentTimeMillis();
-
-        Long auctionId = Long.valueOf(event.get("auctionId").toString());
-        String action = event.get("action").toString();
-
-        long dbStart = System.currentTimeMillis();
-
-        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USERNAME, DB_PASSWORD)) {
-
-            context.getLogger().log("[시간] DB 연결: " + (System.currentTimeMillis() - dbStart) + "ms");
-
-            if ("START".equals(action)) {
-                startAuction(conn, auctionId, context);
-            } else if ("END".equals(action)) {
-                endAuction(conn, auctionId, context);
-            } else {
-                return "Invalid action: " + action;
+                long dbStart = System.currentTimeMillis();
+                try (Connection conn = DriverManager.getConnection(DB_URL, DB_USERNAME, DB_PASSWORD)) {
+                    context.getLogger().log("[시간] DB 연결: " + (System.currentTimeMillis() - dbStart) + "ms");
+                    if ("START".equals(action)) {
+                        startAuction(conn, auctionId, context);
+                    } else if ("END".equals(action)) {
+                        endAuction(conn, auctionId, context);
+                    }
+                }
+            } catch (Exception e) {
+                context.getLogger().log("[Lambda] Error: " + e.getMessage());
+                throw new RuntimeException(e);
             }
-            return "OK";
-        } catch (Exception e) {
-            context.getLogger().log("[Lambda] Error: " + e.getMessage());
-            throw new RuntimeException(e);
         }
+        return "OK";
     }
 
     // context: 람다 실행환경 정보를 담고 있음. aws가 주입
