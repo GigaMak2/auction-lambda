@@ -7,10 +7,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.params.ScanParams;
+import redis.clients.jedis.resps.ScanResult;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.util.List;
 import java.util.Map;
 
 // sqs가 이 코드를 트리거해서 rds 변경 + redis 발행
@@ -28,6 +31,9 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
     private static final JedisPool jedisPool = new JedisPool(
             new JedisPoolConfig(), REDIS_HOST, REDIS_PORT, 2000, true
     );
+
+    private static final int EVICT_CACHE_LOOP_BATCH_SIZE = 100;
+    private static final int EVICT_CACHE_LOOP_UPPER_BOUND = 100;
 
     @Override
     public String handleRequest(SQSEvent event, Context context) {
@@ -90,6 +96,14 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
             }
         }
+
+        // cache eviction
+        long evictionStart = System.currentTimeMillis();
+
+        evictCache("auction::getAuction::%s".formatted(auctionId), context);
+        evictCache("auction::getManyAuctionsPublic::*", context);
+
+        context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
     }
 
     private void endAuction(Connection conn, Long auctionId, Context context) throws Exception {
@@ -176,6 +190,14 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
             }
         }
+
+        // cache eviction
+        long evictionStart = System.currentTimeMillis();
+
+        evictCache("auction::getAuction::%s".formatted(auctionId), context);
+        evictCache("auction::getManyAuctionsPublic::*", context);
+
+        context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
     }
 
 
@@ -209,6 +231,57 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent,String> {
             context.getLogger().log("[Notification] 이벤트 발행: " + payload);
         } catch (Exception e) {
             context.getLogger().log("[Notification] 발행 실패: " + e.getMessage());
+        }
+    }
+
+    private void evictCache(String pattern, Context context) {
+        context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실행.".formatted(
+                    pattern
+        ));
+
+        try (Jedis jedis = jedisPool.getResource()){
+            String cursor = ScanParams.SCAN_POINTER_START;
+            ScanParams scanParams = new ScanParams().match(pattern).count(EVICT_CACHE_LOOP_BATCH_SIZE);
+            
+            // 혹시 몰라 Lambda가 무한 루프에 빠지는 것을 막기 위해 최대
+            // EVICT_CACHE_LOOP_UPPER_BOUND 만큼만 돌도록 짰습니다.
+            //
+            // 그럼 evictCache가 제거 할 수 있는 최대 cache 갯수는 EVICT_CACHE_LOOP_UPPER_BOUND * EVICT_CACHE_LOOP_BATCH_SIZE 입니다.
+            //
+            // 하지만 이렇게 지울 수 있는 cache 갯수가 정해져 있더라도 괜찮다고 생각합니다. 예를들어
+            //
+            // cache TTL이 10분이고 
+            //
+            // EVICT_CACHE_LOOP_UPPER_BOUND과 EVICT_CACHE_LOOP_BATCH_SIZE가 각각 100 이라고 쳤을 때
+            //
+            // 10분 이 지난 cache들을 다 지워질 테니 10분 이내에 저희 사용자들이 100 * 100 = 10000개의 cache를 생성 하지 않는 이상 괜찮을 거라 생각합니다.
+            //
+            for(int i=0; i<EVICT_CACHE_LOOP_UPPER_BOUND; i++) {
+                ScanResult<String> scan = jedis.scan(cursor, scanParams);
+
+                List<String> scanResults = scan.getResult();
+
+                if (!scanResults.isEmpty()) {
+                    jedis.unlink(scanResults.toArray(new String[0]));
+                }
+
+                // 저희가 cache를 다 지우기도 전에 EVICT_CACHE_LOOP_UPPER_BOUND를 부딪쳤다는 사실을 log
+                if (i == EVICT_CACHE_LOOP_UPPER_BOUND - 1 && !scan.getCursor().equals("0")) {
+                    context.getLogger().log("[Cache-Evict] key (%s) cache eviction을 다 하기 전에 제한 횟수에 도달했습니다.".formatted(
+                                pattern
+                    ));
+                }
+
+                if (scan.getCursor().equals("0")) {
+                    break;
+                }
+
+                cursor = scan.getCursor();
+            }
+        } catch (Exception e) {
+            context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실패: %s".formatted(
+                        pattern, e.getMessage()
+            ));
         }
     }
 }
