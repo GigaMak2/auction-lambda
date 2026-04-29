@@ -26,7 +26,8 @@ public class AuctionLambda implements RequestHandler<Map<String, Object>, String
 
             LocalDateTime targetTime = LocalDateTime.parse(targetTimeStr);
             // 두 시간 차이의 초 계산(지금시간, 경매시작/종료시간)
-            long delaySeconds = ChronoUnit.SECONDS.between(LocalDateTime.now(), targetTime);
+            // chronounit이 소수점을 버리기 때문에 1초 보정
+            long delaySeconds = ChronoUnit.SECONDS.between(LocalDateTime.now(), targetTime) +1;
             // 5분전 트리거라서 900을 넘을 일은 없지만 안전장치로 설정
             // 이미 지났으면 0으로, 최대 시간(15분) 초과면 15분(900)으로
             delaySeconds = Math.max(0, Math.min(delaySeconds, 900));
