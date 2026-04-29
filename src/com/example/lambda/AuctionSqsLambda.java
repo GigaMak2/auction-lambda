@@ -8,6 +8,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.params.ScanParams;
+import redis.clients.jedis.resps.ScanResult;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -17,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 
 // sqs가 이 코드를 트리거해서 rds 변경 + redis 발행
+
 public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchResponse> {
 
     private static final String DB_URL = System.getenv("DB_URL");
@@ -31,6 +34,10 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
     private static final JedisPool jedisPool = new JedisPool(
             new JedisPoolConfig(), REDIS_HOST, REDIS_PORT, 2000, true
     );
+
+
+    private static final int EVICT_CACHE_LOOP_BATCH_SIZE = 100;
+    private static final int EVICT_CACHE_LOOP_UPPER_BOUND = 100;
 
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
@@ -99,6 +106,12 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 }
 
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+
+
+                long evictionStart = System.currentTimeMillis();
+                evictCache("auction::getAuction::%s".formatted(auctionId), context);
+                evictCache("auction::getManyAuctionsPublic::*", context);
+                context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
             } else {
                 context.getLogger().log("[SKIP] 이미 처리된 경매 START: auctionId=" + auctionId);
             }
@@ -124,8 +137,13 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 String updateAuction = "UPDATE auctions SET auction_status = 'DONE' WHERE id = ? AND auction_status = 'ACTIVE'";
                 try (PreparedStatement ps2 = conn.prepareStatement(updateAuction)) {
                     ps2.setLong(1, auctionId);
+
+                    long queryStart = System.currentTimeMillis();
+
                     // updated > 0 중복 처리 방지
                     int updated = ps2.executeUpdate();
+
+                    context.getLogger().log("[시간] DB 쿼리: " + (System.currentTimeMillis() - queryStart) + "ms");
                     if (updated > 0) {
                         // 경매 결과 저장
                         String insertResult = "INSERT INTO auction_results (price, auction_id, buyer_id, seller_id, bid_id) " +
@@ -163,6 +181,12 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                             }
                         }
                         context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+
+                        // 캐시 삭제
+                        long evictionStart = System.currentTimeMillis();
+                        evictCache("auction::getAuction::%s".formatted(auctionId), context);
+                        evictCache("auction::getManyAuctionsPublic::*", context);
+                        context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
                     } else {
                         // skip된 경우 로그
                         context.getLogger().log("[SKIP] 이미 처리된 경매 END: auctionId=" + auctionId);
@@ -175,8 +199,12 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 String updateAuction = "UPDATE auctions SET auction_status = 'NO_BID' WHERE id = ? AND auction_status = 'ACTIVE'";
                 try (PreparedStatement ps2 = conn.prepareStatement(updateAuction)) {
                     ps2.setLong(1, auctionId);
+
+                    long queryStart = System.currentTimeMillis();
                     // updated > 0 중복 처리 방지
                     int updated = ps2.executeUpdate();
+
+                    context.getLogger().log("[시간] DB 쿼리: " + (System.currentTimeMillis() - queryStart) + "ms");
                     if (updated > 0) {
                         long redisStart = System.currentTimeMillis();
                         publishToRedis(auctionId, "AUCTION_NO_BID", context);
@@ -192,6 +220,12 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                             }
                         }
                         context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
+
+                        // 캐시 삭제
+                        long evictionStart = System.currentTimeMillis();
+                        evictCache("auction::getAuction::%s".formatted(auctionId), context);
+                        evictCache("auction::getManyAuctionsPublic::*", context);
+                        context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
                     } else {
                         // skip된 경우 로그
                         context.getLogger().log("[SKIP] 이미 처리된 경매 NO_BID: auctionId=" + auctionId);
@@ -232,6 +266,45 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
             context.getLogger().log("[Notification] 이벤트 발행: " + payload);
         } catch (Exception e) {
             context.getLogger().log("[Notification] 발행 실패: " + e.getMessage());
+        }
+    }
+
+    private void evictCache(String pattern, Context context) {
+        context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실행.".formatted(pattern));
+
+        try (Jedis jedis = jedisPool.getResource()){
+            // scanParams: 키가 많을 때 나눠서 조회
+            String cursor = ScanParams.SCAN_POINTER_START;
+            ScanParams scanParams = new ScanParams().match(pattern).count(EVICT_CACHE_LOOP_BATCH_SIZE);
+
+            for(int i=0; i<EVICT_CACHE_LOOP_UPPER_BOUND; i++) {
+                ScanResult<String> scan = jedis.scan(cursor, scanParams);
+
+                List<String> scanResults = scan.getResult();
+
+                // 스캔으로 찾은 키 삭제(unlink)
+                if (!scanResults.isEmpty()) {
+                    jedis.unlink(scanResults.toArray(new String[0]));
+                }
+
+                // 저희가 cache를 다 지우기도 전에 EVICT_CACHE_LOOP_UPPER_BOUND를 부딪쳤다는 사실을 log
+                if (i == EVICT_CACHE_LOOP_UPPER_BOUND - 1 && !scan.getCursor().equals("0")) {
+                    context.getLogger().log("[Cache-Evict] key (%s) cache eviction을 다 하기 전에 제한 횟수에 도달했습니다.".formatted(
+                            pattern
+                    ));
+                }
+                // 0이면 스캔 완료이므로 종료
+                if (scan.getCursor().equals("0")) {
+                    break;
+                }
+
+                // 현재 커서 위치 확인
+                cursor = scan.getCursor();
+            }
+        } catch (Exception e) {
+            context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실패: %s".formatted(
+                    pattern, e.getMessage()
+            ));
         }
     }
 }
