@@ -35,3 +35,9 @@ jobs:
           aws lambda update-function-code \
             --function-name auction-sqs-handler \
             --zip-file fileb://build/libs/auction-lambda-0.0.1-SNAPSHOT.jar
+          aws lambda update-function-code \
+            --function-name auction-sqs-consumer \
+            --zip-file fileb://build/libs/auction-lambda-0.0.1-SNAPSHOT.jar
+          aws lambda update-function-code \
+            --function-name auction-scheduler \
+            --zip-file fileb://build/libs/auction-lambda-0.0.1-SNAPSHOT.jar
