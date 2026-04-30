@@ -216,6 +216,14 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
 
                     context.getLogger().log("[시간] DB 쿼리: " + (System.currentTimeMillis() - queryStart) + "ms");
                     if (updated > 0) {
+
+                        // 입찰 상태 CLOSED로 변경
+                        String updateBids = "UPDATE bids SET status = 'CLOSED' WHERE auction_id = ?";
+                        try (PreparedStatement ps4 = conn.prepareStatement(updateBids)) {
+                            ps4.setLong(1, auctionId);
+                            ps4.executeUpdate();
+                        }
+
                         long redisStart = System.currentTimeMillis();
                         publishToRedis(auctionId, "AUCTION_NO_BID", context);
 
