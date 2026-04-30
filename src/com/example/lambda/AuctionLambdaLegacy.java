@@ -1,9 +1,8 @@
 package com.example.lambda;
 
+
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
-import com.amazonaws.services.lambda.runtime.events.SQSBatchResponse;
-import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
@@ -14,19 +13,16 @@ import redis.clients.jedis.resps.ScanResult;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-// sqs가 이 코드를 트리거해서 rds 변경 + redis 발행
-
-public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchResponse> {
+public class AuctionLambdaLegacy implements RequestHandler<Map<String, Object>, String> {
 
     private static final String DB_URL = System.getenv("DB_URL");
     private static final String DB_USERNAME = System.getenv("DB_USERNAME");
     private static final String DB_PASSWORD = System.getenv("DB_PASSWORD");
-    static final String REDIS_HOST = System.getenv("REDIS_HOST");
-    static final int REDIS_PORT = 6379;
+    private static final String REDIS_HOST = System.getenv("REDIS_HOST");
+    private static final int REDIS_PORT = 6379;
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
     // static 으로 만들어 재사용
@@ -35,42 +31,37 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
             new JedisPoolConfig(), REDIS_HOST, REDIS_PORT, 2000, true
     );
 
-
     private static final int EVICT_CACHE_LOOP_BATCH_SIZE = 100;
     private static final int EVICT_CACHE_LOOP_UPPER_BOUND = 100;
 
     @Override
-    public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
+    public String handleRequest(Map<String, Object> event, Context context) {
 
-        // 실패한 메시지만 담아서 재시도 예정
-        List<SQSBatchResponse.BatchItemFailure> failures = new ArrayList<>();
+        context.getLogger().log("[시간] Lambda 시작: " + System.currentTimeMillis());
 
-        for (SQSEvent.SQSMessage message : event.getRecords()) {
-            try {
-                Map<String, Object> body = objectMapper.readValue(message.getBody(), Map.class);
-                Long auctionId = Long.valueOf(body.get("auctionId").toString());
-                String action = body.get("action").toString();
+        long start = System.currentTimeMillis();
 
-                long dbStart = System.currentTimeMillis();
-                try (Connection conn = DriverManager.getConnection(DB_URL, DB_USERNAME, DB_PASSWORD)) {
-                    context.getLogger().log("[시간] DB 연결: " + (System.currentTimeMillis() - dbStart) + "ms");
-                    if ("START".equals(action)) {
-                        startAuction(conn, auctionId, context);
-                    } else if ("END".equals(action)) {
-                        endAuction(conn, auctionId, context);
-                    }
-                }
-            } catch (Exception e) {
-                context.getLogger().log("[Lambda] Error: " + e.getMessage());
-                // 실패한 메시지만 재시도
-                failures.add(SQSBatchResponse.BatchItemFailure.builder()
-                        .withItemIdentifier(message.getMessageId())
-                        .build());
+        Long auctionId = Long.valueOf(event.get("auctionId").toString());
+        String action = event.get("action").toString();
+
+        long dbStart = System.currentTimeMillis();
+
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USERNAME, DB_PASSWORD)) {
+
+            context.getLogger().log("[시간] DB 연결: " + (System.currentTimeMillis() - dbStart) + "ms");
+
+            if ("START".equals(action)) {
+                startAuction(conn, auctionId, context);
+            } else if ("END".equals(action)) {
+                endAuction(conn, auctionId, context);
+            } else {
+                return "Invalid action: " + action;
             }
+            return "OK";
+        } catch (Exception e) {
+            context.getLogger().log("[Lambda] Error: " + e.getMessage());
+            throw new RuntimeException(e);
         }
-        return SQSBatchResponse.builder()
-                .withBatchItemFailures(failures)
-                .build();
     }
 
     // context: 람다 실행환경 정보를 담고 있음. aws가 주입
@@ -108,6 +99,7 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
 
 
+                // 캐시 삭제
                 long evictionStart = System.currentTimeMillis();
                 evictCache("auction::getAuction::%s".formatted(auctionId), context);
                 evictCache("auction::getManyAuctionsPublic::*", context);
@@ -125,7 +117,6 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
             ps.setLong(1, auctionId);
             var rs = ps.executeQuery();
 
-            // 낙찰자가 있다면
             if (rs.next()) {
                 // 낙찰 처리
                 Long winnerId = rs.getLong("user_id");
@@ -133,18 +124,14 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 java.math.BigDecimal price = rs.getBigDecimal("price");
 
                 // 경매 상태 DONE으로 변경
-                // AND auction_status = active 조건 추가
                 String updateAuction = "UPDATE auctions SET auction_status = 'DONE' WHERE id = ? AND auction_status = 'ACTIVE'";
                 try (PreparedStatement ps2 = conn.prepareStatement(updateAuction)) {
                     ps2.setLong(1, auctionId);
-
                     long queryStart = System.currentTimeMillis();
-
-                    // updated > 0 중복 처리 방지
                     int updated = ps2.executeUpdate();
-
                     context.getLogger().log("[시간] DB 쿼리: " + (System.currentTimeMillis() - queryStart) + "ms");
-                    if (updated > 0) {
+                    if(updated > 0) {
+
                         // 경매 결과 저장
                         String insertResult = "INSERT INTO auction_results (price, auction_id, buyer_id, seller_id, bid_id) " +
                                 "SELECT ?, ?, user_id, ?, ? FROM auctions WHERE id = ? " +
@@ -167,6 +154,7 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                         }
 
                         long redisStart = System.currentTimeMillis();
+
                         publishToRedis(auctionId, "AUCTION_ENDED", context);
 
                         String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
@@ -175,9 +163,10 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                             var auctionRs = selectPs.executeQuery();
                             if (auctionRs.next()) {
                                 String itemName = auctionRs.getString("item_name");
-                                Long sellerId = auctionRs.getLong("user_id");
+                                Long buyerId = auctionRs.getLong("user_id");
+
                                 publishNotification("AUCTION_CLOSED_WIN", winnerId, auctionId, itemName, context);
-                                publishNotification("AUCTION_CLOSED_BUYER", sellerId, auctionId, itemName, context);
+                                publishNotification("AUCTION_CLOSED_BUYER", buyerId, auctionId, itemName, context);
                             }
                         }
                         context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
@@ -188,25 +177,23 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                         evictCache("auction::getManyAuctionsPublic::*", context);
                         context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
                     } else {
-                        // skip된 경우 로그
                         context.getLogger().log("[SKIP] 이미 처리된 경매 END: auctionId=" + auctionId);
+
                     }
                 }
-                // 낙찰자가 없다면
+
             } else {
                 // 유찰 처리
-                // AND auction_status = active 조건 추가
                 String updateAuction = "UPDATE auctions SET auction_status = 'NO_BID' WHERE id = ? AND auction_status = 'ACTIVE'";
                 try (PreparedStatement ps2 = conn.prepareStatement(updateAuction)) {
                     ps2.setLong(1, auctionId);
-
                     long queryStart = System.currentTimeMillis();
-                    // updated > 0 중복 처리 방지
                     int updated = ps2.executeUpdate();
-
                     context.getLogger().log("[시간] DB 쿼리: " + (System.currentTimeMillis() - queryStart) + "ms");
-                    if (updated > 0) {
+                    if(updated > 0) {
+
                         long redisStart = System.currentTimeMillis();
+
                         publishToRedis(auctionId, "AUCTION_NO_BID", context);
 
                         String selectSql = "SELECT item_name, user_id FROM auctions WHERE id = ?";
@@ -215,8 +202,9 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                             var auctionRs = selectPs.executeQuery();
                             if (auctionRs.next()) {
                                 String itemName = auctionRs.getString("item_name");
-                                Long sellerId = auctionRs.getLong("user_id");
-                                publishNotification("AUCTION_NO_BID", sellerId, auctionId, itemName, context);
+                                Long buyerId = auctionRs.getLong("user_id");
+
+                                publishNotification("AUCTION_NO_BID", buyerId, auctionId, itemName, context);
                             }
                         }
                         context.getLogger().log("[시간] Redis 발행: " + (System.currentTimeMillis() - redisStart) + "ms");
@@ -227,10 +215,12 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                         evictCache("auction::getManyAuctionsPublic::*", context);
                         context.getLogger().log("[시간] Redis cache eviction: " + (System.currentTimeMillis() - evictionStart) + "ms");
                     } else {
-                        // skip된 경우 로그
                         context.getLogger().log("[SKIP] 이미 처리된 경매 NO_BID: auctionId=" + auctionId);
+
                     }
+
                 }
+
             }
         }
     }
