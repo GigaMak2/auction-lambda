@@ -17,6 +17,7 @@ import java.sql.PreparedStatement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 
 // sqs가 이 코드를 트리거해서 rds 변경 + redis 발행
 
@@ -39,6 +40,14 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
     private static final int EVICT_CACHE_LOOP_BATCH_SIZE = 100;
     private static final int EVICT_CACHE_LOOP_UPPER_BOUND = 100;
 
+    // rds 핀닝의 원인인 세션 설정을 스킵하기 위해 세팅
+    private static final Properties DB_PROPS = new Properties();
+    static {
+        DB_PROPS.setProperty("user", DB_USERNAME);
+        DB_PROPS.setProperty("password", DB_PASSWORD);
+        DB_PROPS.setProperty("assumeMinServerVersion", "9.0");
+    }
+
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
 
@@ -52,7 +61,8 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 String action = body.get("action").toString();
 
                 long dbStart = System.currentTimeMillis();
-                try (Connection conn = DriverManager.getConnection(DB_URL, DB_USERNAME, DB_PASSWORD)) {
+
+                try (Connection conn = DriverManager.getConnection(DB_URL, DB_PROPS)) {
                     context.getLogger().log("[시간] DB 연결: " + (System.currentTimeMillis() - dbStart) + "ms");
                     if ("START".equals(action)) {
                         startAuction(conn, auctionId, context);
