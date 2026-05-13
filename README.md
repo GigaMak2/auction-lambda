@@ -95,17 +95,6 @@ auctions.auction_status: ACTIVE → NO_BID
 
 배치 내 메시지 처리 중 일부 실패 시 `SQSBatchResponse`의 `BatchItemFailure`에 실패한 메시지 ID만 반환하여 해당 메시지만 재시도합니다.
 
----
-
-### 3. `AuctionLambdaLegacy` — Legacy (직접 처리)
-
-| 항목 | 내용 |
-|------|------|
-| 트리거 | Amazon EventBridge Scheduler |
-| 배포 함수명 | `auction-scheduler` |
-| 역할 | EventBridge 직접 트리거 → RDS 상태 변경 + Redis 발행 (SQS 없음) |
-
-SQS 도입 이전 방식으로, `AuctionSqsLambda`와 동일한 로직을 수행하지만 SQS 중간 단계 없이 EventBridge에서 직접 실행됩니다.
 
 ---
 
@@ -143,8 +132,7 @@ PostgreSQL JDBC의 `assumeMinServerVersion=9.0` 속성을 설정하여 세션 �
 ```
 src/com/example/lambda/
 ├── AuctionLambda.java         # EventBridge 트리거 → SQS 지연 메시지 발행
-├── AuctionSqsLambda.java      # SQS 트리거 → RDS 상태 변경 + Redis Pub/Sub 발행
-└── AuctionLambdaLegacy.java   # Legacy: EventBridge 직접 트리거 처리
+└── AuctionSqsLambda.java      # SQS 트리거 → RDS 상태 변경 + Redis Pub/Sub 발행
 ```
 
 ---
@@ -154,10 +142,10 @@ src/com/example/lambda/
 | 변수명 | 설명 | 사용 Lambda |
 |--------|------|------------|
 | `SQS_QUEUE_URL` | SQS 큐 URL | AuctionLambda |
-| `DB_URL` | PostgreSQL JDBC URL | AuctionSqsLambda, Legacy |
-| `DB_USERNAME` | DB 사용자명 | AuctionSqsLambda, Legacy |
-| `DB_PASSWORD` | DB 비밀번호 | AuctionSqsLambda, Legacy |
-| `REDIS_HOST` | Redis 호스트 | AuctionSqsLambda, Legacy |
+| `DB_URL` | PostgreSQL JDBC URL | AuctionSqsLambda |
+| `DB_USERNAME` | DB 사용자명 | AuctionSqsLambda|
+| `DB_PASSWORD` | DB 비밀번호 | AuctionSqsLambda |
+| `REDIS_HOST` | Redis 호스트 | AuctionSqsLambda |
 
 ---
 
@@ -169,7 +157,7 @@ src/com/example/lambda/
 ./gradlew jar
 ```
 
-`build/libs/auction-lambda-0.0.1-SNAPSHOT.jar` (Fat JAR)가 생성됩니다.
+`build/libs/auction-lambda-0.0.1-SNAPSHOT.jar` (JAR)가 생성됩니다.
 
 ### CI/CD
 
