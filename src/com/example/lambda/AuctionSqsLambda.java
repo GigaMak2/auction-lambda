@@ -10,9 +10,15 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.params.ScanParams;
 import redis.clients.jedis.resps.ScanResult;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +46,18 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
         DB_PROPS.setProperty("password", DB_PASSWORD);
         DB_PROPS.setProperty("assumeMinServerVersion", "9.0");
     }
+
+    private static final String ES_URL = System.getenv("ELASTICSEARCH_URIS");
+    private static final String ES_AUCTION_INDEX = System.getenv("ELASTICSEARCH_AUCTION_INDEX");
+    private static final String ES_USERNAME = System.getenv("ELASTICSEARCH_USERNAME");
+    private static final String ES_PASSWORD = System.getenv("ELASTICSEARCH_PASSWORD");
+
+    private static final String ES_BASIC_AUTH = "Basic " + java.util.Base64.getEncoder()
+        .encodeToString((ES_USERNAME + ":" + ES_PASSWORD).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+    private static final HttpClient httpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(2))
+        .build();
 
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
@@ -103,6 +121,7 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                 evictCache("auction::getAuction::%s".formatted(auctionId), context);
                 evictCache("auction::getManyAuctionsPublic::*", context);
 
+                updateElasticsearchStatus(auctionId, "ACTIVE", context);
             } else {
                 context.getLogger().log("[SKIP] 이미 처리된 경매: auctionId=" + auctionId);
             }
@@ -169,6 +188,7 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                         evictCache("auction::getAuction::%s".formatted(auctionId), context);
                         evictCache("auction::getManyAuctionsPublic::*", context);
 
+                        updateElasticsearchStatus(auctionId, "DONE", context);
                     } else {
                         context.getLogger().log("[SKIP] 이미 처리된 경매: auctionId=" + auctionId);
                     }
@@ -207,6 +227,8 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
                         long evictionStart = System.currentTimeMillis();
                         evictCache("auction::getAuction::%s".formatted(auctionId), context);
                         evictCache("auction::getManyAuctionsPublic::*", context);
+
+                        updateElasticsearchStatus(auctionId, "NO_BID", context);
                     } else {
                         // skip된 경우 로그
                         context.getLogger().log("[SKIP] 이미 처리된 경매 NO_BID: auctionId=" + auctionId);
@@ -275,6 +297,33 @@ public class AuctionSqsLambda implements RequestHandler<SQSEvent, SQSBatchRespon
             context.getLogger().log("[Cache-Evict] key (%s) cache eviction 실패: %s".formatted(
                     pattern, e.getMessage()
             ));
+        }
+    }
+
+    private void updateElasticsearchStatus(Long auctionId, String status, Context context) {
+        try {
+            Map<String, Object> body = Map.of("doc", Map.of("status", status));
+            String payload = objectMapper.writeValueAsString(body);
+
+            String endpoint = "%s/%s/_update/%d".formatted(ES_URL, ES_AUCTION_INDEX, auctionId);
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(endpoint))
+                    .timeout(Duration.ofSeconds(3))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", ES_BASIC_AUTH)
+                    .POST(HttpRequest.BodyPublishers.ofString(payload))
+                    .build();
+
+            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+
+            if (resp.statusCode() >= 300) {
+                context.getLogger().log("[ES] status update 실패: auctionId=%d, code=%d, body=%s".formatted(
+                        auctionId, resp.statusCode(), resp.body()));
+            }
+        } catch (Exception e) {
+            context.getLogger().log("[ES] status update 예외: auctionId=%d, %s".formatted(
+                    auctionId, e.getMessage()));
         }
     }
 }
